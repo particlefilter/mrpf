@@ -1,7 +1,7 @@
 /***********************************************************
 *            Generate Input File                           *
 * Details : https://github.com/particlefilter/mrpf/        *
-* Copyright(c)2016 particlefilter, University of Liverpool *
+* Copyright(c)2016 University of Liverpool                 *
 ************************************************************/
 
 #include <iostream>
