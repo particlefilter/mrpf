@@ -39,6 +39,7 @@ These instructions will allow you to run the particle filter Hadoop and Spark so
 >  3. Compile the code :  ```sbt package```
 >  4. Run the code : ```sbt run``` or ```spark-submit –master="yarn"  –num-executors=8 –executor-cores=10 PF_Spark.scala```. Use ```nohup``` similarly with Hadoop to
 > run the command into the background.
+
 >  Depending the installation it is required to configure the Spark properties via the [Spark configuration](http://spark.apache.org/docs/latest/configuration.html#spark-configuration).
 ### Contents
 
