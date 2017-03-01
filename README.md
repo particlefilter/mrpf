@@ -33,13 +33,13 @@ These instructions will allow you to run the particle filter Hadoop and Spark so
 >> nohup hadoop jar myjar.jar PF_Hadoop input0 output 1024 &
 
 > #### Spark
-> The assumption is that Apache Spark is already installed in [cluster mode](http://spark.apache.org/docs/latest/cluster-overview.html) with the Hadoop YARN  cluster manager. 
+> The assumption is that Apache Spark is installed in [standalone mode](http://spark.apache.org/docs/latest/spark-standalone.html#spark-standalone-mode) or [cluster mode](http://spark.apache.org/docs/latest/cluster-overview.html) with the Hadoop YARN  cluster manager
 >  1. Setup the [sbt tool](http://spark.apache.org/docs/latest/quick-start.html#self-contained-applications)
 >  2. Copy the .txt file to HDFS : ```hadoop fs -put in2_10.txt```
 >  3. Compile the code :  ```sbt package```
 >  4. Run the code : ```sbt run``` or ```spark-submit –master="yarn"  –num-executors=8 –executor-cores=10 PF_Spark.scala```. Use ```nohup``` similarly with Hadoop to
 > run the command into the background.
-
+>  Depending the installation it is required to configure the Spark properties via the [Spark configuration](http://spark.apache.org/docs/latest/configuration.html#spark-configuration).
 ### Contents
 
 - src/ : Contains 
