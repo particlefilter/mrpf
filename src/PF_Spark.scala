@@ -5,7 +5,6 @@
 ************************************************************/
 
 import org.apache.spark.{SparkContext,SparkConf}
-import org.apache.spark.SparkContext._
 import math.{ceil,floor,log,pow,sqrt,cos,Pi,exp,abs,log1p,max}
 import org.apache.spark.rdd.RDD
 import scala.util.Random
@@ -17,56 +16,47 @@ import org.apache.spark.storage.StorageLevel._
 
 object PF_Spark {
   def main(args: Array[String]) {
-	
+    //start time
+    val t0 = System.nanoTime()
+    
+    //basic configuration local mode
     val conf = new SparkConf()
-                          .setAppName("GenericNV")
-                          .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-                          .set("spark.driver.memory","40g")
-                          .set("spark.executor.memory","10g")	
-
-	
+          .setMaster("local[2]")
+          .setAppName("Particle Filter")
+    
     val sc = new SparkContext(conf)
     
-    //setting elapsed time
-    val t1 = System.nanoTime()
-    
-    //number of particles
+    //number of particles. must be power of 2
     val Nlength:Int = pow(2,10).toInt
     
-    //number of .toIntsteps log2(N), where is N is the input size
+    //exponent of particles input size
     val NumIter:Int = (log(Nlength)/log(2)).toInt;
     
     //Initialisation
     val Qk_1 = sc.broadcast(10)        //variance of the system noise
     val Rk   = sc.broadcast(1)         //variance of the measurement noise
-    val time:Int    = 3                //number of iterations
-    val Nt:Float   =  0.50f*Nlength    //Neff threshold
+    val time:Int    = 5                //number of iterations
+    val Nt:Float   =  0.50f*Nlength    //effective sample size threshold
+    var x:Float       = 1.0f           //initial actual value
+    var z:Float       = 1.0f           //measurement value
+    val initVar:Float = 10.0f          //variance of the initial estimate
     
-    //Particle Filter
-    var x:Float       = 1.0f  //initial actual value
-    var z:Float       = 1.0f   //measurement value
-    val initVar:Float = 10.0f  //define the variance of the initial estimate
-	
     //STEP 1: Create Particles
-    
-	//initial input file from HDFS
-    var vec_Pardd = sc.textFile("in2_10.txt")
+    var vec_Pardd = sc.textFile("in2_10")
                       .map(x => {val t= x.split(","); (t(0).toInt -> t(1).toFloat) })
-
-    val t0 = System.nanoTime()
-	
+    
     //random values
     val rand = ThreadLocalRandom.current()
     
-    //create particles
+    //particles initialisation
     vec_Pardd = vec_Pardd.mapValues( x => x.toFloat + (sqrt(initVar).toFloat)*rand.nextGaussian.toFloat)
-						 .cache 
-	
+                         .persist(MEMORY_AND_DISK)
+    
     for (t <- 1 to time){
       //update the actual system and the measurement equation
       x = (0.5f*x + 25.0f*x/(1+x*x) + 8.0f*cos(1.2f*(t-1)) + sqrt(Qk_1.value)*rand.nextGaussian).toFloat
       
-      //number of .toIntsteps log2(N), where is N is the input size
+      //exponent of particles input size
       val NumIter:Int = (log(Nlength)/log(2)).toInt;
       
       //update the actual measurement equation
@@ -75,7 +65,6 @@ object PF_Spark {
       //STEP 2: Importance Weights
       
       //state update
-      //new_staterdd = vec_Pardd.map( {case (x,y) => (x,y)})
       val new_staterdd = vec_Pardd.mapValues( x => (0.5*x.toFloat + 25.0*x/(1.0+x*x) + 8.0*cos(1.2*(t-1)) + (sqrt(Qk_1.value))*rand.nextGaussian).toFloat)
       
       //measurement update
@@ -87,61 +76,64 @@ object PF_Spark {
       //Weights Normalisation
       vecl_weightsrdd = WeightsNormalization(vecl_weightsrdd, NumIter, Nlength)
       
-      //STEP 3: Resampling
-	  
+      //STEP 3: Resampling (if needed)
+	    
       //effective sample size
       val Neff = EffectiveSampleSize(vecl_weightsrdd, NumIter)
       
-      //Neff threshold
-      val Nt:Float   = 0.50f*Nlength
-      
       if (Neff <= Nt){
-        println("Running Resampling")
+        println("Run Resampling")
         
-        //compute exp(vec_lweights)
+        //convert weights to non-log form
         vecl_weightsrdd = vecl_weightsrdd.mapValues(x =>  exp(x).toFloat)
         
-        //minimum variance resampling
+        //Step A : Minimum variance resampling - produce number of copies for each particle 
         val Ncopies:RDD[(Int,Int)] = minvarresample(vecl_weightsrdd, NumIter, Nlength, sc)
         
-        //bitonic sort = sorted Ncopies
+        //Step B : Sort the number of copies
         val bsout: RDD[(Int, (Int, Float))] = bitonicSort(Ncopies, new_staterdd, NumIter, Nlength)
         
-        //redistribution
+        //Step C : Redistribution - produce the new particles population
         //algorithm steps
         val maxIter:Int = NumIter - 1
         val leafs:Int = maxIter
         
         val redout = redistribution(bsout, Nlength, leafs, sc)
         
+        //Step D : Estimate the mean value 
         val xest:RDD[Float] = xestimate(redout, Nlength, NumIter)
         
+        //print real/estimated value
         println("Iteration        = " + t)
         println("real value       = " + x)
         println("estimated value  = " + xest.first())
         println("------------------------------------")
         
+        //particles update
         vec_Pardd = redout
         
       }else{
-        val xest:RDD[Float] = xestimate(new_staterdd, Nlength, NumIter).cache()
+        //estimate the mean value
+        val xest:RDD[Float] = xestimate(new_staterdd, Nlength, NumIter)
         
+        //print real/estimated value
         println("Iteration        = " + t)
         println("real value       = " + x)
         println("estimated value  = " + xest.first())
         println("------------------------------------")
         
+        //particles update
         vec_Pardd = new_staterdd
       }
     }
     
     //end time
-    val t2 = System.nanoTime()
+    val t1 = System.nanoTime()
     println("==============================")
-    println("Total Time                    : " + (t2-t0)/1000000000.0 +  " sec")
+    println("Total Time                    : " + (t1-t0)/1000000000.0 +  " sec")
     println("PROGRAM_END")
     
-    System.exit(0)
+    sc.stop
   } //end_main
   
   
@@ -150,80 +142,84 @@ object PF_Spark {
    ***********************************/
   
   def xestimate(vec_Pardd: RDD[(Int,Float)], Nlength: Int, NumIter: Int) : RDD[Float] = {
-    //compute sum(vec_Particles)
     var vec_ParddSum:RDD[(Int, Float)] = vec_Pardd
     
+    //compute sum(vec_Particles)
     for(i <- 1 to NumIter){
         vec_ParddSum =  vec_ParddSum.map(x => (ceil(x._1/2.0).toInt -> x._2))
                                     .reduceByKey(_+_)
     }
     
-    //compute xest = mean(vec_Particles)
+    //particles mean estimation
     val xest:RDD[Float] = vec_ParddSum.map(x => x._2/Nlength)
     
     (xest)
   }
-
   
   /***************************
    *  Redistribute Algorithm
    ***************************/
   
   def redistribution(in:RDD[(Int, (Int, Float))], Nlength:Int, maxIter:Int, sc:SparkContext):RDD[(Int, Float)] = {
-    //var vecPar = vP
+    //perform the computations on the old population of particles and the number of copies
+    //using a separate vector
+    var nco = in.map({case (x,y) => x -> y._1}) //number of copies
+    var osa = in.map({case (x,y) => x -> y._2}) //old population of particles
     
-    var nco = in.map({case (x,y) => x -> y._1})
-    var osa = in.map({case (x,y) => x -> y._2})
-    
+    //the method begins from the root of the balanced binary tree (i.e. level 0)
+    //and re-executes the method for log(N) steps, where N is the particles size
     val level:Int = 0
     
-    //val (ncop, osam) = callred(nco, osa, level)
     val oldsamples = callred(nco, osa, Nlength, maxIter, sc:SparkContext)
     
     oldsamples
   }
   
   def callred(nc: RDD[(Int, Int)], os: RDD[(Int, Float)], Nlength:Int, maxIter:Int, sc:SparkContext):RDD[(Int, Float)] = {
-    //var vecPar = vP
     
-    var nco = nc
-    var osa = os
+    var nco = nc //number of copies
+    var osa = os //particles population
     
+    //Build the binary tree within the two vectors, 'nco' and 'osa';
+    //The root node, level 0, handles all the keys from [1,...,N]
+    //In level 1, the left and right nodes handle the keys [1,...,N/2] and N/2+1 to N, respectively.
+    //In the leaf nodes, each leaf node handles a single key.
     for(level <- 0 until (maxIter+1)){
         
         val adj = (Nlength/pow(2,level)).toInt
         val NumIter = (log(adj)/log(2.0)).toInt
         
-        //another way to compute the zeros on disk and then send it to the rdd is  : id*adj - adj + id
         //compute max nodeID
         val maxNodeID:Int = (Nlength/((Nlength/pow(2,level)))).toInt
-        val zerostemp = new ListBuffer[(Int,Int)]
         
-        for ( j <- maxNodeID to 1 by -1){
-          zerostemp ++= ListBuffer((j*adj-adj+j, 0))
-        }
+        val ztmp = new ListBuffer[(Int,Int)]
+        ztmp ++=  ListBuffer((0, 0))
         
-        val zeros = sc.parallelize(zerostemp)
+        val ztmprdd = sc.parallelize(ztmp)
+        
+        val  zeros = ztmprdd.map(x => for(j <- maxNodeID to 1 by -1) yield (j*adj-adj+j, 0))
+                            .flatMap(x => x)
         
         //cN = [0 cumsum(Ncopies)]
+        //the cumulative summation computation is achieved across all nodes
         val cNtemp: RDD[(Int, Int)] = cumulativeSummationred(nco, NumIter)
                                       .map( d => {val nodeID:Int = ceil(d._1/(Nlength/pow(2,level))).toInt; (d._1+nodeID -> d._2)})
         
         //add the pairs with the zero values
-        val cN = cNtemp.union(zeros).coalesce(1)
+        val cN = cNtemp.union(zeros).coalesce(ztmprdd.partitions.size)
         
         val mindif: RDD[(Int, Int)] = cN.filter(d => {val zeroval:Int = d._1 % (adj+1); zeroval <= (adj/2 + 1) && zeroval != 0 })
                                         .map( d => {val nkey = d._1 - (ceil(d._1/(adj+1)).toInt - 1)-1; 
                                                     if(d._2 <= (adj/2)) (nkey -> d._2) else (nkey -> (adj/2))  })
         
-		//compute even diff()
+	//compute even diff()
         val w1: RDD[(Int, Int)] = mindif.map(x => (x._1 % adj -> (x._1 -> x._2)))
                                         .filter( x => x._1 <= adj/2 && x._1 >= 0 )
                                         .map{ case (x,y) => { (y._1 -> y._2)}}
                                         .map(x => (ceil(x._1/2.0).toInt -> x._2))
                                         .reduceByKey((x,y) =>  math.abs(x-y))
                                         .map(x => if (x._1 == 0) (x._1+1 -> x._2) else (2*x._1-1 -> x._2))
-                                       
+        
         //compute odd diff()
         val w2:RDD[(Int, Int)] = mindif.map(x => (x._1 % adj -> ( x._1 -> x._2)))
                                        .filter( x => x._1 <= (adj/2 + 1) && x._1 > 1 )
@@ -233,7 +229,7 @@ object PF_Spark {
                                        .map(x => (2*x._1 -> x._2))
         
         //merge to have the Ncopies
-        val Nfirst = w1.union(w2).coalesce(1)
+        val Nfirst = w1.union(w2).coalesce(ztmprdd.partitions.size)
         
         val oldsamples_first:RDD[(Int,Float)] = osa.map{ x => {val zeroval = x._1 % adj; 
                                                                if (zeroval <= (adj/2) && zeroval != 0 )  (x._1 -> x._2)
@@ -246,7 +242,7 @@ object PF_Spark {
                                                      else (x._1 -> -1)}}
                                          .filter( x => x._2 != -1)
          
-        val Nraw1:RDD[(Int,Int)] = (NrawTemp.union(Nfirst)).coalesce(1)
+        val Nraw1:RDD[(Int,Int)] = (NrawTemp.union(Nfirst)).coalesce(ztmprdd.partitions.size)
                                             .reduceByKey( (x,y) => abs((x-y)))
         
         //compute nleft = sum(cN(2:(N/2+1))<=N/2)
@@ -298,8 +294,8 @@ object PF_Spark {
         val nright:RDD[(Int, Int)] = nrightemp.map(x => (ceil(x._1/2.0).toInt -> x._2) )
         
         //compute nlrtemp = nleft -nright
-        val nlrtemp: RDD[(Int, Int)] = nleft.union(nright).coalesce(1)
-                                        .reduceByKey( (x,y) => abs(x - y) ).cache()
+        val nlrtemp: RDD[(Int, Int)] = nleft.union(nright).coalesce(ztmprdd.partitions.size)
+                                        .reduceByKey( (x,y) => abs(x - y) )
         
         //create nlr vector                                         
         val nlr: RDD[(Int, Int)] = nlrtemp.map(x => for(i <- x._1*adj to (x._1*adj-adj+1) by -1) yield (i -> x._2))
@@ -328,7 +324,7 @@ object PF_Spark {
         // oldkey
         val oldsamples2oldkey:RDD[(Int, (Int, Float))] = oldsamples2t.map{case (x,y) => {(x -> ( Int.MinValue -> y._1))}}
         
-        val oldsamples2temp:RDD[(Int, (Int, Float))] = (oldsamples2newkey.union(oldsamples2oldkey)).coalesce(1)
+        val oldsamples2temp:RDD[(Int, (Int, Float))] = (oldsamples2newkey.union(oldsamples2oldkey)).coalesce(ztmprdd.partitions.size)
                                                                           .reduceByKey( (x,y) => {
                                                                               val origkey = max(x._1,y._1);
                                                                               val origoldsamples = max(x._2,y._2);
@@ -357,7 +353,7 @@ object PF_Spark {
                                                                    val fv:Int = y._2.toInt;  //cast Float to int
                                                                    (x+nodeID -> ((y._1.toInt+nodeID) -> fv )) }}
         
-        val fnc:RDD[(Int, Int)] =  (fnewkey.union(foldkey)).coalesce(1)
+        val fnc:RDD[(Int, Int)] =  (fnewkey.union(foldkey))
                                            .reduceByKey( (x,y) => {
                                                val origkey = max(x._1,y._1);
                                                val origoldsamples = max(x._2,y._2);
@@ -372,8 +368,7 @@ object PF_Spark {
         val oldsamples2_old2:RDD[(Int, Float)] = oldsamples2.map(x => {val nodeID:Int = ceil(x._1/(Nlength/pow(2,level))).toInt;
                                                                   (x._1+nodeID -> x._2)})
         
-        val olds2 = fos.union(oldsamples2_old2).coalesce(1)
-                                               .reduceByKey(_*_) 
+        val olds2 = fos.union(oldsamples2_old2).reduceByKey(_*_) 
         
         //compute olds1 = ~f.*oldsamples(:,(N/2+1):N)
         //filter the correct olsamples values :  oldsamples(:,(N/2+1):N)
@@ -393,14 +388,14 @@ object PF_Spark {
         val notfnc:RDD[(Int, Int)]    = fnc.map( x => { if (x._2 == 0)  (x._1 -> 1) else (x._1 -> 0) })
         val notfos:RDD[(Int, Float)] = fos.map( x => { if (x._2 == 0)  (x._1 -> 1.0f) else (x._1 -> 0.0f) })
         
-        val olds1:RDD[(Int, Float)] = (notfos.union(oldsa)).coalesce(1)
+        val olds1:RDD[(Int, Float)] = (notfos.union(oldsa))
                                               .reduceByKey(_*_)
         
         //compute oldsamples_second = ~f.*oldsamples(:,(N/2+1):N) + f.*oldsamples2
-        val oldsamples_second = (olds1.union(olds2)).coalesce(1).map{ case (x,y) => {val nodeID:Int = ceil(x/(adj+1)).toInt;
+        val oldsamples_second = (olds1.union(olds2)).map{ case (x,y) => {val nodeID:Int = ceil(x/(adj+1)).toInt;
                                                                      (x+adj/2-1-(nodeID-1)-1 -> y)}}
                                       .reduceByKey(_+_)              
-                                            
+        
         //compute N1 = ~f.*Ncopies((N/2+1):N)
         
         //filter to the correct keys for  : Ncopies((N/2+1):N)
@@ -412,7 +407,7 @@ object PF_Spark {
                                       else (x._1+nodeID-nk -> -1)})
                            .filter( x => x._2 != -1)
         
-        val N1 = (N1c.union(notfnc)).coalesce(1)
+        val N1 = (N1c.union(notfnc))
                                     .reduceByKey(_*_)
         
         //compute Nraw = Nraw(index)
@@ -421,7 +416,7 @@ object PF_Spark {
         
         val Nrawnewkey: RDD[(Int, (Int, Int))] = oldsamples2newkey.map{case (x,y) => {(x -> (y._1 -> -1) )}}
         
-        val Nraw2:RDD[(Int, (Int, Int))] =  (Nrawoldkey.union(Nrawnewkey)).coalesce(1)
+        val Nraw2:RDD[(Int, (Int, Int))] =  (Nrawoldkey.union(Nrawnewkey))
                                                        .reduceByKey( (x,y) => { val origkey = max(x._1,y._1);
                                                                      val origoldsamples = max(x._2,y._2);
                                                                      (origkey -> origoldsamples)})
@@ -430,19 +425,19 @@ object PF_Spark {
                                             ((y._1+nodeID) -> y._2)}}
         
         //compute N2 = f.*Nraw(index)
-        val N2:RDD[(Int, Int)] = (Nraw.union(fnc)).coalesce(1)
+        val N2:RDD[(Int, Int)] = (Nraw.union(fnc))
                                       .reduceByKey(_*_)
         
         //compute Nsecond = ~f.*Ncopies((N/2+1):N) + f.*Nraw(index)
-        val Nsecond:RDD[(Int, Int)] = (N1.union(N2)).coalesce(1)
+        val Nsecond:RDD[(Int, Int)] = (N1.union(N2))
                                          .map(x  => {val nodeID:Int = ceil(x._1/(adj+1)).toInt;
                                                      (x._1+adj/2-1-(nodeID-1)-1 -> x._2)})
                                          .reduceByKey(_+_)
-		
-        nco = Nfirst.union(Nsecond).coalesce(1)
-		osa =  oldsamples_first.union(oldsamples_second).coalesce(1)
+	
+        nco = Nfirst.union(Nsecond).repartition(1)
+	osa =  oldsamples_first.union(oldsamples_second).repartition(1)
         nco.count
-		osa.count
+	osa.count
     }
     
     osa
@@ -487,7 +482,6 @@ object PF_Spark {
      store ++= ListBuffer(list)
      if (it == NumSteps) store else sumcsmred(list, NumSteps, it+1, store)
   }
- 
   
   /****************
    *  Bitonic Sort
@@ -549,12 +543,12 @@ object PF_Spark {
                         .reduceByKey((x,y) => x.union(y))
                         .flatMap({case (x,y) => mapperB(x,y)})
     }
-	
+    
     /**********
      * Return *
      **********/
     
-    //return output
+    //return output in correct form 
     (blist)
     
   }
@@ -636,7 +630,7 @@ object PF_Spark {
     
     var add:Int = 0
     
-    var maxIter:Int = (log(length)/log(2.0).toFloat).toInt
+    var maxIter:Int = (log(length)/log(2.0).toDouble).toInt
     
     if (MRstep == maxIter){
         k = ceil(akey/2.0).toInt
@@ -656,7 +650,7 @@ object PF_Spark {
                 sep = 0
             }
         }else{
-            add = ((ceil(akey/chunk.toFloat) - 1) * chunk/2 ).toInt
+            add = ((ceil(akey/chunk.toDouble) - 1) * chunk/2 ).toInt
             k = akey % va + add
             
             if(akey > chunk/2 + offset * ceil(akey/chunk) || akey % chunk == 0){
@@ -693,9 +687,9 @@ object PF_Spark {
     
     if (MRstep == 1){
         va = length/2
-        k = ceil(akey.toFloat/2.0).toInt
+        k = ceil(akey.toDouble/2.0).toInt
         
-        var c:Int = floor(akey.toFloat/2.0).toInt % 2
+        var c:Int = floor(akey.toDouble/2.0).toInt % 2
         
         if(c == 1){
           sep = 1
@@ -704,7 +698,7 @@ object PF_Spark {
         }
         
         if (step > 1){
-            side = ceil(akey.toFloat/pow(2,step).toFloat).toInt
+            side = ceil(akey.toDouble/pow(2,step).toDouble).toInt
             
             if(side % 2 == 1){
                 if(akey % 2 == 1){
@@ -727,18 +721,18 @@ object PF_Spark {
         if(akey <= chunk){
             k = akey % va
             
-            if(akey > chunk.toFloat/2.0){
+            if(akey > chunk.toDouble/2.0){
                 sep = 1
             }else{
                 sep = 0
             }
         }else{
-            add = ((ceil(akey.toFloat/chunk.toFloat)-1.0)*chunk/2.0).toInt
+            add = ((ceil(akey.toDouble/chunk.toDouble)-1.0)*chunk/2.0).toInt
             
             k =  akey % va + add
             
-            side = ceil(akey.toFloat/pow(2,step).toFloat).toInt
-            rside = ceil(akey.toFloat/2.0).toInt
+            side = ceil(akey.toDouble/pow(2,step).toDouble).toInt
+            rside = ceil(akey.toDouble/2.0).toInt
             
             if(side % 2 ==1){
                 if(rside % 2 == 1){
@@ -770,11 +764,11 @@ object PF_Spark {
             }
             
         }else{
-            add = ((ceil(akey/chunk.toFloat) - 1.0)*chunk/2.0).toInt
+            add = ((ceil(akey/chunk.toDouble) - 1.0)*chunk/2.0).toInt
             k = akey % va + add
             
-            side = ceil(akey.toFloat/pow(2.0,step).toFloat).toInt
-            rside = ceil(akey.toFloat/va.toFloat).toInt
+            side = ceil(akey.toDouble/pow(2.0,step).toDouble).toInt
+            rside = ceil(akey.toDouble/va.toDouble).toInt
             
             if(side % 2 == 1){
                 if(rside % 2 == 1){
@@ -824,7 +818,7 @@ object PF_Spark {
     
     (mlist)
   }
-  
+ 
   
   /*******************************
    *  Minimum Variance Resampling
@@ -835,40 +829,26 @@ object PF_Spark {
       //compute the cumsum of the list
       val csmw: RDD[(Int, Float)] = cumulativeSummationmvr(lweights, NumIter)
       
-      //compute w(end) vector
-      //extract w(end)
-      //create a list with size N with w(end)
-      val wend: RDD[(Int, Float)]  = csmw.filter(x => x._1 == Nlength)
-                                          .map(x => for(i <- x._1 to 1 by -1) yield (i -> x._2)  ) 
-                                          .flatMap(x => x)
-      
       //broadcast random value
       val randNum = sc.broadcast(Random.nextFloat)
       
       //compute w = floor(w*N+rand)
-      val csmwf: RDD[(Int, Float)] = csmw.join(wend)
-                                          .mapValues(x => floor(x._1*Nlength*1.0f/x._2 + randNum.value*0.5f).toFloat)
+      val csmwf: RDD[(Int, Int)] = csmw.mapValues(a => (floor(a * Nlength + 0.5f * randNum.value)).toInt)
       
-      //odd diff()
-      //map the keys to compute the even diff()
-      //filter the keys - ignore the largest key
-      //compute the new keys and the odd part of the diff()
+      //odd values of difference between adjacent elements
       val w1: RDD[(Int, Int)] = csmwf.map(x  => (floor(x._1/2.0).toInt -> x._2))
                                     .filter(x => x._1 < Nlength/2)
                                     .reduceByKey((x,y) =>  math.abs(x-y))
                                     .map(x => if (x._1 == 0) (x._1+1 -> x._2.toInt) else (2*x._1+1 -> x._2.toInt))
       
-      //even diff()
-      //map the keys to compute the odd diff()
-      //filter the keys - ignore the smallest key
-      //compute the new keys and the even part of the diff()
+      //even values of difference between adjacent elements
       val w2: RDD[(Int, Int)] = csmwf.map(x => (ceil(x._1/2.0).toInt -> x._2))
                                       .filter(x => x._1 > 0)
                                       .reduceByKey{ (x,y) => { math.abs(x-y)}}
                                       .map(x => (2*x._1 -> x._2.toInt))
       
       //merge to have the Ncopies
-      val Ncopiesrdd = w1.union(w2).coalesce(1)
+      val Ncopiesrdd = w1.union(w2).coalesce(csmwf.partitions.size)
       
       (Ncopiesrdd)
   }
@@ -912,8 +892,7 @@ object PF_Spark {
     
     if (opit == 1) (out3) else backstepsmvr((out3), NumSteps, opit-1, store)
   }
-
-
+  
   def mapOddDiff(xx: Int,b: Float):(Int, Float) = {
       var a  = floor(xx/2.0).toInt
       (a, b)
@@ -939,10 +918,10 @@ object PF_Spark {
                                                      .reduceByKey(_+_)
       }
       
-      //retrieve the sum pair of the sum(exp(vec_lweights)) and store the value part of the pair
-      val sumExpWeightNeffValue = sumExpVecl_weightsrdd.cache.first._2.toFloat
+      //retrieve the total sum pair of the sum(exp(vec_lweights)) and store the value part of the pair
+      val sumExpWeightNeffValue = sumExpVecl_weightsrdd.first._2.toFloat
       
-      //compute effective sample size, Neff
+      //compute effective sample size
       val Neff:Float = 1.0f/sumExpWeightNeffValue
       
       Neff
