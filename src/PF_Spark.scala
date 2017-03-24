@@ -16,7 +16,7 @@ import org.apache.spark.storage.StorageLevel._
 
 object PF_Spark {
   def main(args: Array[String]) {
-    //start time
+    //start time, can be ignored
     val t0 = System.nanoTime()
     
     //basic configuration local mode
@@ -70,10 +70,10 @@ object PF_Spark {
       //measurement update
       val new_measurdd = new_staterdd.mapValues( x =>  (x*x/20.0).toFloat)
       
-      //create particle weights
+      //assign weight to each particle
       var vecl_weightsrdd = new_measurdd.mapValues( x =>  (-log(sqrt(2*Pi*Rk.value)) - ((z.value - x)*(z.value - x))/(2*Rk.value)).toFloat)
       
-      //Weights Normalisation
+      //weights normalisation
       vecl_weightsrdd = WeightsNormalization(vecl_weightsrdd, NumIter, Nlength)
       
       //STEP 3: Resampling (if needed)
@@ -84,23 +84,23 @@ object PF_Spark {
       if (Neff <= Nt){
         println("Run Resampling")
         
-        //convert weights to non-log form
+        //convert weights to non-logarithmic form
         vecl_weightsrdd = vecl_weightsrdd.mapValues(x =>  exp(x).toFloat)
         
         //Step A : Minimum variance resampling - produce number of copies for each particle 
         val Ncopies:RDD[(Int,Int)] = minvarresample(vecl_weightsrdd, NumIter, Nlength, sc)
         
-        //Step B : Sort the number of copies
+        //Step B : Sort the number of copies in descending order
         val bsout: RDD[(Int, (Int, Float))] = bitonicSort(Ncopies, new_staterdd, NumIter, Nlength)
         
-        //Step C : Redistribution - produce the new particles population
+        //Step C : Redistribution - produce the new population of particles
         //algorithm steps
         val maxIter:Int = NumIter - 1
         val leafs:Int = maxIter
         
         val redout = redistribution(bsout, Nlength, leafs, sc)
         
-        //Step D : Estimate the mean value 
+        //Step D : Mean value estimation
         val xest:RDD[Float] = xestimate(redout, Nlength, NumIter)
         
         //print real/estimated value
@@ -113,7 +113,7 @@ object PF_Spark {
         vec_Pardd = redout
         
       }else{
-        //estimate the mean value
+        //Mean value estimation
         val xest:RDD[Float] = xestimate(new_staterdd, Nlength, NumIter)
         
         //print real/estimated value
@@ -434,8 +434,8 @@ object PF_Spark {
                                                      (x._1+adj/2-1-(nodeID-1)-1 -> x._2)})
                                          .reduceByKey(_+_)
 	
-        nco = Nfirst.union(Nsecond).repartition(1)
-	osa =  oldsamples_first.union(oldsamples_second).repartition(1)
+        nco = Nfirst.union(Nsecond).repartition(ztmprdd.partitions.size)
+	osa =  oldsamples_first.union(oldsamples_second).repartition(ztmprdd.partitions.size)
         nco.count
 	osa.count
     }
