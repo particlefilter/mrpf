@@ -2,7 +2,7 @@
 
 This is an improved MapReduce implementation of the particle filter using the systematic resampling,
 also known as minimum variance resampling. The proposed resampling strategy is with the parallel complexity
-of O( (log(n))^2) instead of the original O( (logn)^3), where n is the particles size.
+of O( (log(N))^2) instead of the original O( (logN)^3), where N is the particles size.
 
 ### Guide to run the code
 These instructions will allow you to run the particle filter Hadoop and Spark source code.
